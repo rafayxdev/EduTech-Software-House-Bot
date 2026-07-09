@@ -267,7 +267,7 @@ app.post('/api/webhook', async (req, res) => {
                     try {
                         // Gemini AI Initialize karein
                         const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-                        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+                        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
                         
                         // 🧠 HIGHLY DETAILED SYSTEM PROMPT (AI Ka Dimaagh)
                         const systemPrompt = `You are a highly professional, polite, and intelligent customer support agent for 'EduTech Software House' based in Pakistan. 
