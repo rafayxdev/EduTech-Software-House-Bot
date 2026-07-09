@@ -2,6 +2,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // NEW: Import Gemini AI
 
 const app = express();
 app.use(bodyParser.json());
@@ -9,8 +10,7 @@ app.use(bodyParser.json());
 // Environment Variables
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'edutech_secure_token_2026'; 
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN; 
-
-// GET Request: Webhook Verification
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // NEW: Gemini Key
 app.get('/api/webhook', (req, res) => {
     let mode = req.query['hub.mode'];
     let token = req.query['hub.verify_token'];
@@ -234,7 +234,7 @@ app.post('/api/webhook', async (req, res) => {
             // 💰 8. PRICING & PACKAGES (PKR)
             // ---------------------------------------------------------
             else if (msg_body === '8') {
-                replyText = `💰 *Pricing & Packages*\nEvery project is unique, but here are our general starting packages Depending on your specific requirements and features, the actual cost may adjust higher or lower to fit your custom needs.\n\n*Select an option (e.g., 8A):*\n*8A* - Basic Package\n*8B* - Standard Package\n*8C* - Premium Package\n*8D* - Custom Solution\n*8E* - Other Inquiry\n\n_Reply '0' for Main Menu._`;
+                replyText = `💰 *Pricing & Packages*\nEvery project is unique, but here are our general starting packages in PKR:\n\n*Select an option (e.g., 8A):*\n*8A* - Basic Package\n*8B* - Standard Package\n*8C* - Premium Package\n*8D* - Custom Solution\n*8E* - Other Inquiry\n\n_Reply '0' for Main Menu._`;
             }
             else if (msg_body === '8a') {
                 replyText = `🥉 *Basic Package*\n• Simple Landing Page or Portfolio\n• Mobile Responsive\n• Basic SEO\n• Starting from: *Rs. 30,000*` + endOfMenuText;
@@ -259,14 +259,63 @@ app.post('/api/webhook', async (req, res) => {
                 replyText = contactTemplate;
             }
 
-            // ---------------------------------------------------------
-            // 📝 FALLBACK (User types a long message, detail, or invalid command)
+// 🧠 FALLBACK & SMART AI AGENT INTEGRATION
             // ---------------------------------------------------------
             else {
-                if (raw_msg.length > 10) {
-                    replyText = `✅ *Message Received!*\n\nThank you for reaching out. We have received your message. If it is an inquiry, please ensure you use the template provided in the Contact Us section and email it to furqanali.cs21@gmail.com.\n\nMeanwhile, you can explore more of our services by replying with a number below:\n\n*1️⃣ Custom Web Development*\n*2️⃣ E-Commerce Solutions*\n*3️⃣ Educational Software (SMS/LMS)*\n*4️⃣ Desktop Applications*\n*5️⃣ Landing Pages & UI/UX*\n*6️⃣ Android Development*\n*7️⃣ AI Integration / Agentic AI*\n*8️⃣ Pricing & Packages*\n*9️⃣ Contact Us / Human Agent*`;
+                // Agar message thoda lamba hai (5 characters se zyada) aur AI Key mojood hai
+                if (raw_msg.length > 5 && GEMINI_API_KEY) {
+                    try {
+                        // Gemini AI Initialize karein
+                        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+                        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+                        
+                        // 🧠 HIGHLY DETAILED SYSTEM PROMPT (AI Ka Dimaagh)
+                        const systemPrompt = `You are a highly professional, polite, and intelligent customer support agent for 'EduTech Software House' based in Pakistan. 
+                        
+                        COMPANY KNOWLEDGE BASE:
+                        - Name: EduTech Software House
+                        - Contact Email: furqanali.cs21@gmail.com
+                        - Developer/Owner Info: Furqan Ali Jumnani (Expert in Web, C# Desktop Apps, and AI).
+                        
+                        OUR SERVICES & EXPERTISE:
+                        1. Custom Web Development (PHP, React, Node.js, Custom Websites).
+                        2. E-Commerce Solutions (Online stores, payment gateways like Stripe/JazzCash/EasyPaisa).
+                        3. Educational Software (Our flagship product: School Management Systems & LMS built in C#/.NET and Web).
+                        4. Desktop Applications (POS, Billing, Inventory management).
+                        5. Landing Pages & UI/UX (High conversion designs).
+                        6. Android App Development.
+                        7. AI Integration (Smart Chatbots, Automations).
+                        
+                        PRICING GUIDELINES (IN PKR):
+                        - Basic Package (Landing Page/Portfolio): Starts at Rs. 30,000.
+                        - Standard Package (Corporate Web/Basic E-commerce): Starts at Rs. 75,000.
+                        - Premium Package (Custom Web Apps/Advanced E-commerce): Starts at Rs. 150,000.
+                        - Custom Solutions (Desktop Apps, SMS, POS, AI): Price determined after consultation.
+                        
+                        YOUR STRICT RULES:
+                        1. You MUST ONLY answer questions related to EduTech Software House, our services, pricing, and software development. 
+                        2. If a user asks about something completely unrelated (e.g., "What is the capital of France?" or "Tell me a joke"), politely decline and say you are an assistant for EduTech Software House and can only help with IT/Software queries.
+                        3. Keep your answers concise, friendly, and short (under 3-4 sentences). Do not write long essays.
+                        4. ALWAYS reply in the exact same language the user uses (e.g., if they speak Roman Urdu like "website kitne ki banegi?", reply in Roman Urdu. If they use pure English, use pure English).
+                        5. If a user wants to finalize a deal, hire you, or asks for something you don't know, tell them to email furqanali.cs21@gmail.com or type 'Contact'.
+                        
+                        User's message: "${raw_msg}"`;
+
+                        // AI se Jawab banwayen
+                        const result = await model.generateContent(systemPrompt);
+                        replyText = result.response.text();
+                        
+                        // Answer ke aakhir mein hamesha menu ka rasta dikhayen
+                        replyText += `\n\n_(Type '0' for Main Menu)_`;
+
+                    } catch (ai_error) {
+                        console.error("AI Generation Error:", ai_error);
+                        // Agar AI fail ho jaye (e.g. server down) toh normal text bhej dein
+                        replyText = `✅ *Message Received!*\n\nThank you for reaching out. We have received your message. If it is an inquiry, please ensure you use the template provided in the Contact Us section and email it to furqanali.cs21@gmail.com.\n\nType *'0'* or *'Menu'* to see options again.`;
+                    }
                 } else {
-                    replyText = `⚠️ *Invalid Option*\n\nI didn't quite catch that. Please type a valid number or letter from the menu.\n\nType *'0'* or *'Menu'* to see all options again.`;
+                    // Agar sirf 1-2 words ka ajeeb message hai (jaise '12', 'z', 'xyz')
+                    replyText = `⚠️ *Invalid Option*\n\nI didn't quite catch that. Please type a valid number or code from the menu.\n\nType *'0'* or *'Menu'* to see all options again.`;
                 }
             }
 
