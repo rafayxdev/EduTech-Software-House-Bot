@@ -6,6 +6,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.use(express.raw({ type: 'audio/*', limit: '16mb' }));
 
 // CORS
 app.use((req, res, next) => {
@@ -91,6 +92,16 @@ function dbSetStatus(convId, status) {
     }).catch(e => console.error("DB set status catch:", e.message));
 }
 
+function dbSetRequestedHuman(convId, value) {
+    if (!supabase) return Promise.resolve();
+    return supabase.from('conversations').update({
+        requested_human: value,
+        updated_at: new Date().toISOString()
+    }).eq('id', convId).then(r => {
+        if (r.error) console.error("DB set requested_human:", r.error.message);
+    }).catch(e => console.error("DB set requested_human catch:", e.message));
+}
+
 function dbStoreMessage(convId, sender, content) {
     if (!supabase) return Promise.resolve();
     return supabase.from('messages').insert({
@@ -123,6 +134,155 @@ function dbGetStatus(convId) {
             }).catch(() => 'bot'),
         new Promise(resolve => setTimeout(() => resolve('bot'), 5000))
     ]);
+}
+
+// ─────────────────────────── MEDIA HELPERS ───────────────────────────
+async function downloadWhatsAppMedia(mediaId) {
+    if (!WHATSAPP_TOKEN) return null;
+    try {
+        const metaRes = await axios.get(`https://graph.facebook.com/v21.0/${mediaId}`, {
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        const url = metaRes.data.url;
+        const mimeType = metaRes.data.mime_type || 'audio/ogg';
+
+        const mediaRes = await axios.get(url, {
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+            responseType: 'arraybuffer'
+        });
+        return { buffer: Buffer.from(mediaRes.data), mimeType, filename: `${mediaId}.ogg` };
+    } catch (err) {
+        console.error("Media download error:", err.message);
+        return null;
+    }
+}
+
+async function uploadToSupabaseStorage(buffer, filename, mimeType, bucket = 'chat-media') {
+    if (!supabase) return null;
+    try {
+        const path = `voice/${Date.now()}_${filename}`;
+        const { error } = await supabase.storage.from(bucket).upload(path, buffer, {
+            contentType: mimeType,
+            upsert: false
+        });
+        if (error) {
+            console.error("Storage upload error:", error.message);
+            return null;
+        }
+        const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+        return data?.publicUrl || null;
+    } catch (err) {
+        console.error("Storage upload catch:", err.message);
+        return null;
+    }
+}
+
+function dbStoreMessageTyped(convId, sender, content, messageType = 'text', mediaUrl = null) {
+    if (!supabase) return Promise.resolve();
+    const row = {
+        conversation_id: convId,
+        sender: sender,
+        content: content,
+        message_type: messageType,
+        media_url: mediaUrl,
+        created_at: new Date().toISOString()
+    };
+    return supabase.from('messages').insert(row).then(r => {
+        if (r.error) console.error("DB store typed msg:", r.error.message);
+    }).catch(e => console.error("DB store typed msg catch:", e.message));
+}
+
+async function uploadToWhatsAppMedia(phoneNumberId, fileBuffer, mimeType, filename) {
+    if (!WHATSAPP_TOKEN || !phoneNumberId) return null;
+    try {
+        const FormData = require('form-data');
+        const form = new FormData();
+        form.append('file', fileBuffer, { filename, contentType: mimeType });
+        form.append('messaging_product', 'whatsapp');
+        form.append('type', mimeType);
+
+        const res = await axios.post(
+            `https://graph.facebook.com/v21.0/${phoneNumberId}/media`,
+            form,
+            {
+                headers: {
+                    ...form.getHeaders(),
+                    'Authorization': `Bearer ${WHATSAPP_TOKEN}`
+                },
+                maxContentLength: Infinity,
+                maxBodyLength: Infinity
+            }
+        );
+        console.log("WhatsApp media upload:", res.data?.id);
+        return res.data?.id || null;
+    } catch (err) {
+        const errData = err.response ? JSON.stringify(err.response.data) : err.message;
+        console.error("WhatsApp media upload error:", errData);
+        return null;
+    }
+}
+
+async function sendWhatsAppAudio(phoneNumberId, to, audioUrl) {
+    if (!WHATSAPP_TOKEN || !phoneNumberId) return false;
+
+    try {
+        // Step 1: Download the audio file from Supabase
+        const audioRes = await axios.get(audioUrl, { responseType: 'arraybuffer' });
+        const fileBuffer = Buffer.from(audioRes.data);
+        const isWebm = audioUrl.endsWith('.webm') || audioUrl.includes('webm');
+        const mimeType = isWebm ? 'audio/webm;codecs=opus' : 'audio/ogg;codecs=opus';
+        const filename = isWebm ? 'voice-message.webm' : 'voice-message.ogg';
+
+        // Step 2: Upload to WhatsApp media API
+        const mediaId = await uploadToWhatsAppMedia(phoneNumberId, fileBuffer, mimeType, filename);
+        if (!mediaId) {
+            console.log("WhatsApp media upload failed, trying document fallback...");
+            // Fallback: send as document
+            try {
+                await axios({
+                    method: 'POST',
+                    url: `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
+                    data: {
+                        messaging_product: 'whatsapp',
+                        to: to,
+                        type: 'document',
+                        document: { link: audioUrl, filename: 'voice-message.webm' }
+                    },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${WHATSAPP_TOKEN}`
+                    }
+                });
+                return true;
+            } catch (docErr) {
+                const errData = docErr.response ? JSON.stringify(docErr.response.data) : docErr.message;
+                console.error("Document fallback also failed:", errData);
+                return false;
+            }
+        }
+
+        // Step 3: Send audio using the media ID
+        await axios({
+            method: 'POST',
+            url: `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
+            data: {
+                messaging_product: 'whatsapp',
+                to: to,
+                type: 'audio',
+                audio: { id: mediaId }
+            },
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${WHATSAPP_TOKEN}`
+            }
+        });
+        console.log("WhatsApp audio sent via media ID:", mediaId);
+        return true;
+    } catch (err) {
+        const errData = err.response ? JSON.stringify(err.response.data) : err.message;
+        console.error("WhatsApp audio send error:", errData);
+        return false;
+    }
 }
 
 // ─────────────────────────── MENU LOGIC ───────────────────────────
@@ -185,7 +345,7 @@ function getMenuReply(msgBody) {
     else if (msgBody === '8d') return { text: `*📋 Custom Solution*\n\nEvery business is unique. Let's discuss your needs.\n\nReply *9* to talk to our team directly.` + nav, setHuman: false };
     else if (msgBody === '8e') return { text: contactTemplate, setHuman: false };
     else if (contactKeywords.includes(msgBody)) {
-        return { text: `*👤 Talk to Our Team*\n\nAapko hamari team ke member se rabta karwa rahe hain!\n\nPlease wait or email us:\n*Email:* furqanali.cs21@gmail.com\n\nHamari team 24 hours ke andar reply degi InshaAllah.`, setHuman: true };
+        return { text: `*👤 Talk to Our Team*\n\nPlease provide your *Name*, *Location*, and *Purpose*. Our human agent will connect with you shortly.\n\nYou can also email us:\n*Email:* furqanali.cs21@gmail.com`, requestHuman: true, setHuman: false };
     }
     return null;
 }
@@ -227,15 +387,75 @@ app.post('/api/send', async (req, res) => {
         console.log(`AGENT SEND result: ${sent}`);
 
         if (sent) {
-            await Promise.all([
-                dbStoreMessage(to, 'agent', text),
-                dbUpdateLastMessage(to, text)
-            ]);
+            await dbUpdateLastMessage(to, text);
         }
 
         res.status(sent ? 200 : 500).json(sent ? { success: true } : { error: 'WhatsApp API failed' });
     } catch (error) {
         console.error("Send error:", error.message);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// ─────────────────────────── POST: Agent Send Audio (from Dashboard) ───────────────────────────
+app.post('/api/send-audio', async (req, res) => {
+    try {
+        const { to, audio, phone_number_id } = req.body;
+        if (!to || !audio) return res.status(400).json({ error: 'Missing to or audio' });
+
+        const pid = phone_number_id || PHONE_NUMBER_ID;
+        console.log(`AGENT SEND AUDIO to ${to}, url: ${audio}`);
+
+        const sent = await sendWhatsAppAudio(pid, to, audio);
+        console.log(`AGENT SEND AUDIO result: ${sent}`);
+
+        if (sent) {
+            await dbUpdateLastMessage(to, '🎙️ Voice Message');
+        }
+
+        res.status(sent ? 200 : 500).json(sent ? { success: true } : { error: 'WhatsApp audio API failed — check bot logs for details' });
+    } catch (error) {
+        console.error("Send audio error:", error.message);
+        res.status(500).json({ error: 'Internal error: ' + error.message });
+    }
+});
+
+// ─────────────────────────── POST: Upload Audio (Dashboard) ───────────────────────────
+app.post('/api/upload-audio', async (req, res) => {
+    try {
+        if (!supabase) return res.status(500).json({ error: 'Supabase not connected' });
+        const { audio, filename, contentType } = req.body;
+        if (!audio) return res.status(400).json({ error: 'Missing audio data' });
+
+        const buffer = Buffer.from(audio, 'base64');
+        const path = `voice/${filename || Date.now() + '_agent.webm'}`;
+
+        // Auto-create bucket if it doesn't exist
+        try {
+            const { data: buckets } = await supabase.storage.listBuckets();
+            const exists = buckets?.some(b => b.name === 'chat-media');
+            if (!exists) {
+                await supabase.storage.createBucket('chat-media', { public: true });
+                console.log("Created chat-media bucket");
+            }
+        } catch (e) {
+            console.log("Bucket check/create:", e.message);
+        }
+
+        const { error: uploadError } = await supabase.storage
+            .from('chat-media')
+            .upload(path, buffer, { contentType: contentType || 'audio/webm', upsert: false });
+
+        if (uploadError) {
+            console.error("Upload audio error:", uploadError.message);
+            return res.status(500).json({ error: uploadError.message });
+        }
+
+        const { data: urlData } = supabase.storage.from('chat-media').getPublicUrl(path);
+        console.log("Audio uploaded:", urlData?.publicUrl);
+        res.json({ url: urlData?.publicUrl || null, path });
+    } catch (err) {
+        console.error("Upload audio catch:", err.message);
         res.status(500).json({ error: 'Internal error' });
     }
 });
@@ -252,9 +472,30 @@ app.post('/api/webhook', async (req, res) => {
             if (messages && messages[0]) {
                 const phone_number_id = changeValue.metadata.phone_number_id;
                 const from = messages[0].from;
-                const raw_msg = (messages[0].text && messages[0].text.body) || "";
+                const msgType = messages[0].type;
+                let raw_msg = '';
+                let audioUrl = null;
+                let messageType = 'text';
 
-                console.log(`[INCOMING] ${from}: ${raw_msg}`);
+                if (msgType === 'audio' && messages[0].audio) {
+                    const audioId = messages[0].audio.id;
+                    console.log(`[INCOMING] ${from}: [audio message] id=${audioId}`);
+                    raw_msg = '🎙️ Voice Message';
+                    messageType = 'audio';
+
+                    try {
+                        const media = await downloadWhatsAppMedia(audioId);
+                        if (media) {
+                            audioUrl = await uploadToSupabaseStorage(media.buffer, media.filename, media.mimeType);
+                            console.log(`[INCOMING] Audio stored: ${audioUrl || 'FAILED'}`);
+                        }
+                    } catch (err) {
+                        console.error("Audio processing error:", err.message);
+                    }
+                } else {
+                    raw_msg = (messages[0].text && messages[0].text.body) || "";
+                    console.log(`[INCOMING] ${from}: ${raw_msg}`);
+                }
 
                 let customerName = from;
                 try {
@@ -271,7 +512,7 @@ app.post('/api/webhook', async (req, res) => {
                     console.log(`[${from}] Human mode - no bot reply`);
                     await Promise.all([
                         dbUpsertConversation(from, customerName),
-                        dbStoreMessage(from, 'customer', raw_msg),
+                        dbStoreMessageTyped(from, 'customer', raw_msg, messageType, audioUrl),
                         dbUpdateLastMessage(from, raw_msg)
                     ]);
                     return res.sendStatus(200);
@@ -282,10 +523,12 @@ app.post('/api/webhook', async (req, res) => {
 
                 let replyText;
                 let setHuman = false;
+                let requestHuman = false;
 
                 if (result) {
                     replyText = result.text;
                     setHuman = result.setHuman;
+                    requestHuman = result.requestHuman || false;
                 } else {
                     replyText = `*Invalid Option*\n\nPlease choose:\n\n*1* Web Dev | *2* E-Commerce\n*3* Education | *4* Desktop Apps\n*5* Landing Pages | *6* Android\n*7* AI | *8* Pricing\n*9* Contact / Human Agent\n\n_(Reply '0' for Main Menu)_`;
                 }
@@ -296,14 +539,14 @@ app.post('/api/webhook', async (req, res) => {
 
                 const dbOps = [
                     dbUpsertConversation(from, customerName),
-                    dbStoreMessage(from, 'customer', raw_msg),
-                    sent ? dbStoreMessage(from, 'bot', replyText) : Promise.resolve(),
+                    dbStoreMessageTyped(from, 'customer', raw_msg, messageType, audioUrl),
+                    sent ? dbStoreMessageTyped(from, 'bot', replyText) : Promise.resolve(),
                     dbUpdateLastMessage(from, replyText)
                 ];
 
-                if (setHuman) {
-                    dbOps.push(dbSetStatus(from, 'human'));
-                    console.log(`[${from}] Auto-switching to HUMAN mode`);
+                if (requestHuman) {
+                    dbOps.push(dbSetRequestedHuman(from, true));
+                    console.log(`[${from}] User requested human agent`);
                 }
 
                 await Promise.all(dbOps);
