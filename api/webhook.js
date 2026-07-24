@@ -3,6 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
+const fluentFfmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+fluentFfmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -192,6 +195,36 @@ function dbStoreMessageTyped(convId, sender, content, messageType = 'text', medi
     }).catch(e => console.error("DB store typed msg catch:", e.message));
 }
 
+let ffmpegInstance = null;
+let ffmpegLoading = null;
+
+async function convertWebmToOgg(webmBuffer) {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const inputPath = path.join(os.tmpdir(), `in_${Date.now()}.webm`);
+    const outputPath = path.join(os.tmpdir(), `out_${Date.now()}.ogg`);
+    fs.writeFileSync(inputPath, webmBuffer);
+    return new Promise((resolve, reject) => {
+        fluentFfmpeg(inputPath)
+            .inputFormat('webm')
+            .audioCodec('libopus')
+            .audioBitrate('64k')
+            .outputOptions('-vn')
+            .save(outputPath)
+            .on('end', () => {
+                const oggBuffer = fs.readFileSync(outputPath);
+                try { fs.unlinkSync(inputPath); } catch(e) {}
+                try { fs.unlinkSync(outputPath); } catch(e) {}
+                resolve(oggBuffer);
+            })
+            .on('error', (err) => {
+                try { fs.unlinkSync(inputPath); } catch(e) {}
+                reject(err);
+            });
+    });
+}
+
 async function uploadToWhatsAppMedia(phoneNumberId, fileBuffer, mimeType, filename) {
     if (!WHATSAPP_TOKEN || !phoneNumberId) return null;
     try {
@@ -228,12 +261,24 @@ async function sendWhatsAppAudio(phoneNumberId, to, audioUrl) {
     try {
         // Step 1: Download the audio file from Supabase
         const audioRes = await axios.get(audioUrl, { responseType: 'arraybuffer' });
-        const fileBuffer = Buffer.from(audioRes.data);
+        let fileBuffer = Buffer.from(audioRes.data);
         const isWebm = audioUrl.endsWith('.webm') || audioUrl.includes('webm');
-        const mimeType = isWebm ? 'audio/webm;codecs=opus' : 'audio/ogg;codecs=opus';
-        const filename = isWebm ? 'voice-message.webm' : 'voice-message.ogg';
 
-        // Step 2: Upload to WhatsApp media API
+        // Step 2: Convert WebM to OGG/Opus if needed (WhatsApp requires OGG for voice notes)
+        if (isWebm) {
+            console.log("Converting WebM to OGG...");
+            try {
+                fileBuffer = await convertWebmToOgg(fileBuffer);
+                console.log("WebM → OGG conversion done, size:", fileBuffer.length);
+            } catch (convErr) {
+                console.error("Conversion failed, sending as raw WebM:", convErr.message);
+            }
+        }
+
+        const mimeType = 'audio/ogg; codecs=opus';
+        const filename = 'voice-message.ogg';
+
+        // Step 3: Upload to WhatsApp media API as OGG
         const mediaId = await uploadToWhatsAppMedia(phoneNumberId, fileBuffer, mimeType, filename);
         if (!mediaId) {
             console.log("WhatsApp media upload failed, trying document fallback...");
@@ -261,7 +306,7 @@ async function sendWhatsAppAudio(phoneNumberId, to, audioUrl) {
             }
         }
 
-        // Step 3: Send audio using the media ID
+        // Step 4: Send audio using the media ID
         await axios({
             method: 'POST',
             url: `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`,
