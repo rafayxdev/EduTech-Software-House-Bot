@@ -5,7 +5,7 @@ const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 app.use(express.raw({ type: 'audio/*', limit: '16mb' }));
 
 // CORS
